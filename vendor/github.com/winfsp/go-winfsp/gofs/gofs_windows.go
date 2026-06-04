@@ -1114,7 +1114,23 @@ func (fs *fileSystem) Rename(
 			return err
 		}
 		if fileInfo != nil {
-			return windows.STATUS_OBJECT_NAME_COLLISION
+			// The target already exists. On a normal Windows volume this is a
+			// hard collision. However, applications that implement atomic
+			// directory swaps (e.g. RPCS3's savedata: remove_all(.backup_)
+			// then rename(save -> .backup_)) rely on the target having just
+			// been deleted. A directory removal issued through WinFsp can be
+			// deferred when a cached handle is still open, so the empty target
+			// may linger past the rename. If the target is an *empty*
+			// directory we remove it and let the rename proceed — an empty
+			// directory carries no data, so this is safe and matches the
+			// caller's intent. Non-empty targets still collide.
+			if fileInfo.IsDir() && fs.targetDirIsEmpty(target) {
+				if rmErr := fs.inner.Remove(target); rmErr != nil {
+					return windows.STATUS_OBJECT_NAME_COLLISION
+				}
+			} else {
+				return windows.STATUS_OBJECT_NAME_COLLISION
+			}
 		}
 	}
 
@@ -1161,6 +1177,21 @@ func (fs *fileSystem) Rename(
 	}
 	handle.lock, newLock = newLock, handle.lock
 	return nil
+}
+
+// targetDirIsEmpty reports whether the given path is a directory with no
+// entries, by opening it through the inner filesystem and reading it.
+func (fs *fileSystem) targetDirIsEmpty(target string) bool {
+	f, err := fs.inner.OpenFile(target, os.O_RDONLY, 0)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	infos, err := f.Readdir(-1)
+	if err != nil {
+		return false
+	}
+	return len(infos) == 0
 }
 
 var _ winfsp.BehaviourRename = (*fileSystem)(nil)
