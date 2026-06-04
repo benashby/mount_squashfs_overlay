@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const version = "0.1.0"
+const version = "1.1.0"
 
 // CLI interface is designed as a drop-in replacement for the mount.exe used by
 // EmulatorLauncher (github.com/RetroBat-Official/emulatorlauncher).
