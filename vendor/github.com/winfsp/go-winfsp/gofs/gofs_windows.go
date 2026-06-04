@@ -336,8 +336,7 @@ const (
 	// behaviours that might violates the intention of the
 	// caller processes and maintain the integrity of the
 	// inner file system.
-	unsupportedCreateOptions = windows.FILE_WRITE_THROUGH |
-		windows.FILE_CREATE_TREE_CONNECTION |
+	unsupportedCreateOptions = windows.FILE_CREATE_TREE_CONNECTION |
 		windows.FILE_NO_EA_KNOWLEDGE |
 		windows.FILE_OPEN_BY_FILE_ID |
 		windows.FILE_RESERVE_OPFILTER |

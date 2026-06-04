@@ -45,6 +45,17 @@ func (ofs *OverlayFileSystem) log(format string, v ...any) {
 	}
 }
 
+func (ofs *OverlayFileSystem) logErr(op, name string, err error) error {
+	if ofs.debug {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %q -> ERROR: %v\n", op, name, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s: %q -> ok\n", op, name)
+		}
+	}
+	return err
+}
+
 var _ gofs.FileSystem = (*OverlayFileSystem)(nil)
 
 // upper converts an overlay path (forward-slash, rooted) to an OS path
@@ -170,78 +181,89 @@ func (ofs *OverlayFileSystem) OpenFile(name string, flag int, perm os.FileMode) 
 }
 
 func (ofs *OverlayFileSystem) Mkdir(name string, perm os.FileMode) error {
+	ofs.log("Mkdir: %q perm=%o", name, perm)
 	if ofs.upperDir == "" {
-		return os.ErrPermission
+		return ofs.logErr("Mkdir", name, os.ErrPermission)
 	}
 	up := ofs.upper(name)
 	if err := os.MkdirAll(up, perm|0111); err != nil {
-		return err
+		return ofs.logErr("Mkdir", name, err)
 	}
 	ofs.removeWhiteout(name)
-	return nil
+	return ofs.logErr("Mkdir", name, nil)
 }
 
 func (ofs *OverlayFileSystem) Remove(name string) error {
+	ofs.log("Remove: %q", name)
 	if ofs.upperDir == "" {
-		return os.ErrPermission
+		return ofs.logErr("Remove", name, os.ErrPermission)
 	}
+
 	up := ofs.upper(name)
 	// Remove from upper if present.
 	info, upperErr := os.Lstat(up)
 	if upperErr == nil {
 		if info.IsDir() {
 			if err := os.RemoveAll(up); err != nil {
-				return err
+				return ofs.logErr("Remove", name, err)
 			}
+			ofs.log("Remove: %q removed from upper (dir)", name)
 		} else {
 			if err := os.Remove(up); err != nil {
-				return err
+				return ofs.logErr("Remove", name, err)
 			}
+			ofs.log("Remove: %q removed from upper (file)", name)
 		}
+	} else {
+		ofs.log("Remove: %q not in upper (%v)", name, upperErr)
 	}
 	// If the entry exists in squashfs, plant a whiteout.
 	if _, err := ofs.squash.Stat(name); err == nil {
+		ofs.log("Remove: %q exists in squashfs, creating whiteout", name)
 		ofs.createWhiteout(name)
 	}
-	return nil
+	return ofs.logErr("Remove", name, nil)
 }
 
 func (ofs *OverlayFileSystem) Rename(source, target string) error {
+	ofs.log("Rename: %q -> %q", source, target)
 	if ofs.upperDir == "" {
-		return os.ErrPermission
+		return ofs.logErr("Rename", source, os.ErrPermission)
 	}
 	srcUp := ofs.upper(source)
 	dstUp := ofs.upper(target)
 
 	if err := os.MkdirAll(filepath.Dir(dstUp), 0755); err != nil {
-		return err
+		return ofs.logErr("Rename", source, err)
 	}
 
 	existsInUpper := false
 	if _, err := os.Lstat(srcUp); err == nil {
 		existsInUpper = true
 	}
+	ofs.log("Rename: %q existsInUpper=%v", source, existsInUpper)
 
 	if existsInUpper {
 		if err := os.Rename(srcUp, dstUp); err != nil {
-			return err
+			return ofs.logErr("Rename", source, err)
 		}
 	} else {
 		// Source only in squashfs: CoW it to the new upper location.
 		if _, err := ofs.squash.Stat(source); err != nil {
-			return os.ErrNotExist
+			return ofs.logErr("Rename", source, os.ErrNotExist)
 		}
 		if err := ofs.copySquashToUpperAt(source, target); err != nil {
-			return err
+			return ofs.logErr("Rename", source, err)
 		}
 	}
 
 	// If source existed in squashfs, hide it with a whiteout.
 	if _, err := ofs.squash.Stat(source); err == nil {
+		ofs.log("Rename: source %q exists in squashfs, creating whiteout", source)
 		ofs.createWhiteout(source)
 	}
 	ofs.removeWhiteout(target)
-	return nil
+	return ofs.logErr("Rename", source, nil)
 }
 
 // ── Whiteout helpers ──────────────────────────────────────────────────

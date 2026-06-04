@@ -20,11 +20,21 @@ const version = "0.1.0"
 // The process runs until killed; killing it unmounts the drive.
 func main() {
 	debug := flag.Bool("debug", false, "enable verbose debug output")
+	logFile := flag.String("log", "", "write debug output to this file (implies -debug)")
 	drive := flag.String("drive", "", "drive letter to mount at, e.g. Z:")
 	flag.String("extractionpath", "", "accepted for compatibility; ignored")
 	overlayPath := flag.String("overlay", "", "persistent writable overlay directory")
 	flag.Usage = usage
 	flag.Parse()
+
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fatalf("cannot open log file %q: %v", *logFile, err)
+		}
+		os.Stderr = f
+		*debug = true
+	}
 
 	if flag.NArg() < 1 {
 		fmt.Fprintf(os.Stderr, "error: squashfs file argument is required\n\n")
@@ -96,13 +106,14 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `squashoverlay v%s - mount a squashfs file as a Windows drive with persistent writable overlay
 
 Usage:
-  squashoverlay.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] <squashfs-file>
+  squashoverlay.exe [-debug] [-log <file>] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] <squashfs-file>
 
 Flags:
   -drive <X:>            Drive letter to mount at (required)
   -extractionpath <dir>  Work/extraction directory (used as overlay if -overlay not given)
   -overlay <dir>         Persistent writable overlay directory (takes precedence)
-  -debug                 Verbose output
+  -debug                 Verbose output to stderr
+  -log <file>            Write verbose output to <file> (implies -debug)
 
 The process runs until killed; killing it unmounts the drive.
 Requires WinFsp >= 1.10: https://github.com/winfsp/winfsp/releases
