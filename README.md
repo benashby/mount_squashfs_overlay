@@ -23,7 +23,9 @@ On Linux a cgofuse/libfuse bridge is used for testing.
 ## Usage
 
 ```
-mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] [-cache-mb <n>] <squashfs-file>
+mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] [-cache-mb <n>]
+          [-disk-cache <dir> [-disk-cache-gb <n>] [-disk-cache-min-free-gb <n>] [-prefetch]]
+          <squashfs-file>
 ```
 
 | Flag | Description |
@@ -32,6 +34,10 @@ mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] [-cache-
 | `-overlay <dir>` | Persistent writable overlay directory (omit for read-only mount) |
 | `-extractionpath <dir>` | Accepted for compatibility with EmulatorLauncher; ignored |
 | `-cache-mb <n>` | Decompressed block cache in MiB, shared by all open files (default 256; `0` disables) |
+| `-disk-cache <dir>` | Keep a local copy of the image's data in `<dir>` (see below) |
+| `-disk-cache-gb <n>` | Size cap for the disk cache in GiB (default 200; `0` = no cap) |
+| `-disk-cache-min-free-gb <n>` | Free space the disk cache leaves on its disk in GiB (default 150; `0` = no floor) |
+| `-prefetch` | With `-disk-cache`, copy the whole image in the background while it is mounted |
 | `-debug` | Verbose output |
 
 The process runs until killed; killing it unmounts the drive.
@@ -47,6 +53,25 @@ This mounts `game.squashfs` at `Z:`, with any writes or deletions persisted into
 
 If a RetroBat-style `.deletions` text file is found in the overlay directory it is
 automatically converted to whiteout files on first mount and then removed.
+
+### Disk cache
+
+For images on a network share, `-disk-cache <dir>` keeps a local copy of
+every part of the image that has been read. Later reads of those parts,
+including after a remount or reboot, come from local disk. The copy is a
+sparse file per image, so it only takes space for what was read, and it holds
+the image's compressed bytes. If the share is unreachable, an image mounts
+from the cache alone, and reads of parts that were never cached fail.
+
+The cache looks after itself. When it grows past `-disk-cache-gb`, or the disk
+it lives on drops below `-disk-cache-min-free-gb` of free space, the least
+recently used 4 MiB chunks are released, across all images in the directory.
+A cache is tied to the image's size, modification time and superblock, so
+replacing an image discards its old cache. Each chunk is checksummed and
+fetched again if the local copy is damaged.
+
+Several mounts can share one cache directory. If two processes mount the
+same image, the second reads it directly without the cache.
 
 ## Comparison with the original EmulatorLauncher mount.exe
 

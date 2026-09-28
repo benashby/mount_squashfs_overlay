@@ -25,6 +25,10 @@ func main() {
 	flag.String("extractionpath", "", "accepted for compatibility; ignored")
 	overlayPath := flag.String("overlay", "", "persistent writable overlay directory")
 	cacheMB := flag.Int64("cache-mb", defaultCacheBytes>>20, "decompressed block cache size in MiB (0 disables)")
+	diskCacheDir := flag.String("disk-cache", "", "keep a local copy of the image's data in this directory")
+	diskCacheGB := flag.Int64("disk-cache-gb", 200, "size cap for -disk-cache, in GiB (0 = no cap)")
+	diskCacheFreeGB := flag.Int64("disk-cache-min-free-gb", 150, "free space -disk-cache leaves on its disk, in GiB (0 = no floor)")
+	prefetch := flag.Bool("prefetch", false, "with -disk-cache, copy the whole image in the background while mounted")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -52,8 +56,11 @@ func main() {
 	if err != nil {
 		fatalf("invalid squashfs path: %v", err)
 	}
-	if _, err := os.Stat(squashFile); err != nil {
-		fatalf("cannot open squashfs file %q: %v", squashFile, err)
+	if *diskCacheDir == "" {
+		// With -disk-cache an unreachable image can still mount from the cache.
+		if _, err := os.Stat(squashFile); err != nil {
+			fatalf("cannot open squashfs file %q: %v", squashFile, err)
+		}
 	}
 
 	driveLetter := normalizeDrive(*drive)
@@ -88,9 +95,34 @@ func main() {
 		fatalf("WinFsp not available: %v\n\nDownload and install WinFsp from:\nhttps://github.com/winfsp/winfsp/releases", err)
 	}
 
-	sq, err := NewSquashLayer(squashFile)
-	if err != nil {
-		fatalf("failed to open squashfs %q: %v", squashFile, err)
+	var sq *SquashLayer
+	var img *CachedImage
+	if *diskCacheDir != "" {
+		dc, err := NewDiskCache(*diskCacheDir, *diskCacheGB<<30, *diskCacheFreeGB<<30)
+		if err != nil {
+			fatalf("cannot open disk cache %q: %v", *diskCacheDir, err)
+		}
+		sq, img, err = NewCachedSquashLayer(squashFile, dc)
+		if err != nil {
+			fatalf("failed to open squashfs %q: %v", squashFile, err)
+		}
+		switch {
+		case img == nil:
+			fmt.Fprintln(os.Stderr, "disk cache for this image is in use by another mount; reading it directly")
+		case !img.Online():
+			fmt.Fprintln(os.Stderr, "image unreachable; serving from the disk cache only")
+		case *prefetch:
+			img.StartPrefetch(func(n int, err error) {
+				if *debug || err != nil {
+					fmt.Fprintf(os.Stderr, "prefetch stopped after %d chunks: %v\n", n, err)
+				}
+			})
+		}
+	} else {
+		var err error
+		if sq, err = NewSquashLayer(squashFile); err != nil {
+			fatalf("failed to open squashfs %q: %v", squashFile, err)
+		}
 	}
 	sq.SetCacheSize(*cacheMB << 20)
 
@@ -99,7 +131,11 @@ func main() {
 	}
 
 	// Mount blocks until the filesystem is unmounted (i.e. this process is killed).
-	if err := Mount(sq, upperDir, driveLetter, *debug); err != nil {
+	err = Mount(sq, upperDir, driveLetter, *debug)
+	if img != nil {
+		img.Close()
+	}
+	if err != nil {
 		fatalf("mount failed: %v", err)
 	}
 }
@@ -115,6 +151,14 @@ Flags:
   -extractionpath <dir>  Work/extraction directory (used as overlay if -overlay not given)
   -overlay <dir>         Persistent writable overlay directory (takes precedence)
   -cache-mb <n>          Decompressed block cache size in MiB (default %d; 0 disables)
+  -disk-cache <dir>      Keep a local copy of the image's data in <dir>; least
+                         recently used data is released automatically
+  -disk-cache-gb <n>     Size cap for -disk-cache in GiB (default 200; 0 = none)
+  -disk-cache-min-free-gb <n>
+                         Free space -disk-cache leaves on its disk in GiB
+                         (default 150; 0 = none)
+  -prefetch              With -disk-cache, copy the whole image in the
+                         background while it is mounted
   -debug                 Verbose output to stderr
   -log <file>            Write verbose output to <file> (implies -debug)
 

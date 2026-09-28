@@ -5,6 +5,7 @@ go 1.25
 require (
 	github.com/KarpelesLab/squashfs v1.2.0
 	github.com/winfsp/cgofuse v1.5.0
+	golang.org/x/sys v0.15.0
 )
 
 require (
@@ -17,5 +18,4 @@ require (
 	github.com/rasky/go-lzo v0.0.0-20200203143853-96a758eda86e // indirect
 	github.com/ulikunitz/xz v0.5.12 // indirect
 	github.com/winfsp/go-winfsp v1.0.3 // indirect
-	golang.org/x/sys v0.15.0 // indirect
 )
