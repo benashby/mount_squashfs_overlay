@@ -38,6 +38,7 @@ mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] [-cache-
 | `-disk-cache-gb <n>` | Size cap for the disk cache in GiB (default 200; `0` = no cap) |
 | `-disk-cache-min-free-gb <n>` | Free space the disk cache leaves on its disk in GiB (default 150; `0` = no floor) |
 | `-prefetch` | With `-disk-cache`, copy the whole image in the background while it is mounted |
+| `-label <text>` | Volume label shown for the drive (Windows) |
 | `-debug` | Verbose output |
 
 The process runs until killed; killing it unmounts the drive.
@@ -72,6 +73,44 @@ fetched again if the local copy is damaged.
 
 Several mounts can share one cache directory. If two processes mount the
 same image, the second reads it directly without the cache.
+
+### Explorer context menu (Windows)
+
+`scripts/install-shell.ps1` installs `mount.exe` and a context menu. With UAC
+on it installs for the current user under `%LOCALAPPDATA%\Programs` and HKCU,
+with no administrator rights. With UAC off, Explorer runs with a full
+administrator token and ignores per-user shell extensions, so the script
+installs for the machine under `%ProgramFiles%` and HKLM, from an
+administrator PowerShell. Build both first:
+
+```
+go build -tags "xz zstd" -o mount.exe .
+cmake -S shell -B shell/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build shell/build
+pwsh scripts/install-shell.ps1
+```
+
+Right-clicking a `.sqfs`, `.squashfs` or `.wsquashfs` file then shows
+"Mount as" and "Mount read-only as", each listing the free drive letters.
+If the image is already mounted, it shows "Open X:" and "Unmount X:" instead,
+and right-clicking a mounted drive shows "Unmount". On Windows 11 these are
+under "Show more options" unless the classic menu is enabled.
+
+A mount started from the menu runs in the background with these defaults:
+
+- writable mounts use the overlay `%USERPROFILE%\squashoverlay\overlays\<image name>`;
+- images on a network drive or UNC path use the disk cache in
+  `%LOCALAPPDATA%\squashoverlay\cache`;
+- the drive's label is the image name;
+- output goes to `%LOCALAPPDATA%\squashoverlay\logs\<letter>.log`.
+
+Every Windows mount reports its file system as `squashoverlay`, records itself
+in `%LOCALAPPDATA%\squashoverlay\mounts\<letter>.txt` and unmounts cleanly
+when the event `Local\squashoverlay-unmount-<letter>` is set, which is what
+"Unmount" does. `scripts/uninstall-shell.ps1` removes the menu.
+
+`shell/menu_probe.exe <dll> <path> [labels...]` prints the menu for a path,
+or runs the item at the given labels, without registering the DLL.
 
 ## Comparison with the original EmulatorLauncher mount.exe
 
