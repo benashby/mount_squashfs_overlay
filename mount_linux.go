@@ -12,11 +12,11 @@ import (
 // Mount mounts the overlay filesystem at mountpoint using libfuse (Linux/macOS).
 // On Linux this is useful for development and testing without a Windows machine.
 // mountpoint should be an existing directory (e.g. "/mnt/test").
-func Mount(sq *SquashLayer, upperDir string, mountpoint string, debug bool) error {
+func Mount(sq *SquashLayer, upperDir string, mountpoint string, opts MountOptions) error {
 	overlayFS := &OverlayFS{
 		squash:   sq,
 		upperDir: upperDir,
-		debug:    debug,
+		debug:    opts.Debug,
 	}
 
 	host := fuse.NewFileSystemHost(overlayFS)

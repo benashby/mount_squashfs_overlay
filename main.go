@@ -19,6 +19,10 @@ const version = "1.1.0"
 //
 // The process runs until killed; killing it unmounts the drive.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "shell-mount" {
+		os.Exit(shellMount(os.Args[2:]))
+	}
+
 	debug := flag.Bool("debug", false, "enable verbose debug output")
 	logFile := flag.String("log", "", "write debug output to this file (implies -debug)")
 	drive := flag.String("drive", "", "drive letter to mount at, e.g. Z:")
@@ -29,6 +33,7 @@ func main() {
 	diskCacheGB := flag.Int64("disk-cache-gb", 200, "size cap for -disk-cache, in GiB (0 = no cap)")
 	diskCacheFreeGB := flag.Int64("disk-cache-min-free-gb", 150, "free space -disk-cache leaves on its disk, in GiB (0 = no floor)")
 	prefetch := flag.Bool("prefetch", false, "with -disk-cache, copy the whole image in the background while mounted")
+	label := flag.String("label", "", "volume label shown for the drive (Windows)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -131,13 +136,20 @@ func main() {
 	}
 
 	// Mount blocks until the filesystem is unmounted (i.e. this process is killed).
-	err = Mount(sq, upperDir, driveLetter, *debug)
+	err = Mount(sq, upperDir, driveLetter, MountOptions{Debug: *debug, Label: *label, Image: squashFile})
 	if img != nil {
 		img.Close()
 	}
 	if err != nil {
 		fatalf("mount failed: %v", err)
 	}
+}
+
+// MountOptions are passed to the platform Mount.
+type MountOptions struct {
+	Debug bool
+	Label string // volume label (Windows)
+	Image string // absolute path of the image, recorded in the mount state (Windows)
 }
 
 func usage() {
@@ -159,6 +171,7 @@ Flags:
                          (default 150; 0 = none)
   -prefetch              With -disk-cache, copy the whole image in the
                          background while it is mounted
+  -label <text>          Volume label shown for the drive
   -debug                 Verbose output to stderr
   -log <file>            Write verbose output to <file> (implies -debug)
 
