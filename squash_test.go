@@ -139,7 +139,16 @@ func TestSquashReadWholeFiles(t *testing.T) {
 // Before the block-size mask fix these panicked (slice bounds out of range)
 // or returned bytes from the wrong offset.
 func TestSquashReadAtAcrossUncompressedFullBlock(t *testing.T) {
-	sq := openFixture(t)
+	for _, cache := range []int64{0, defaultCacheBytes} {
+		sq := openFixture(t)
+		sq.SetCacheSize(cache)
+		t.Run(map[bool]string{true: "cached", false: "uncached"}[cache > 0], func(t *testing.T) {
+			testReadAtAcrossUncompressedFullBlock(t, sq)
+		})
+	}
+}
+
+func testReadAtAcrossUncompressedFullBlock(t *testing.T, sq *SquashLayer) {
 	want := fixtureBig()
 	f, err := sq.Open("/big.bin")
 	if err != nil {

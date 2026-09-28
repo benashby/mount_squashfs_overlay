@@ -24,6 +24,7 @@ func main() {
 	drive := flag.String("drive", "", "drive letter to mount at, e.g. Z:")
 	flag.String("extractionpath", "", "accepted for compatibility; ignored")
 	overlayPath := flag.String("overlay", "", "persistent writable overlay directory")
+	cacheMB := flag.Int64("cache-mb", defaultCacheBytes>>20, "decompressed block cache size in MiB (0 disables)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -91,6 +92,7 @@ func main() {
 	if err != nil {
 		fatalf("failed to open squashfs %q: %v", squashFile, err)
 	}
+	sq.SetCacheSize(*cacheMB << 20)
 
 	if *debug {
 		fmt.Fprintf(os.Stderr, "Mounting %s at %s ...\n", squashFile, driveLetter)
@@ -112,12 +114,13 @@ Flags:
   -drive <X:>            Drive letter to mount at (required)
   -extractionpath <dir>  Work/extraction directory (used as overlay if -overlay not given)
   -overlay <dir>         Persistent writable overlay directory (takes precedence)
+  -cache-mb <n>          Decompressed block cache size in MiB (default %d; 0 disables)
   -debug                 Verbose output to stderr
   -log <file>            Write verbose output to <file> (implies -debug)
 
 The process runs until killed; killing it unmounts the drive.
 Requires WinFsp >= 1.10: https://github.com/winfsp/winfsp/releases
-`, version)
+`, version, defaultCacheBytes>>20)
 }
 
 func normalizeDrive(s string) string {

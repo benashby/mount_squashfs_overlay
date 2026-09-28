@@ -33,9 +33,10 @@ type dirIndex map[string]string
 //   - sb  (KarpelesLab) for per-block FUSE reads
 //   - cq  (CalebQ42)    for parallel-WriteTo CoW copies
 type SquashLayer struct {
-	sb   *karp.Superblock
-	cq   caleb.Reader
-	size int64
+	sb    *karp.Superblock
+	cq    caleb.Reader
+	size  int64
+	cache *blockCache // nil when disabled
 	// dirCache maps an fs-relative directory path → dirIndex (lowercase→realname).
 	// Populated lazily on first case-insensitive miss for a given directory.
 	// Safe to cache permanently: squashfs is immutable.
@@ -68,10 +69,17 @@ func NewSquashLayer(path string) (*SquashLayer, error) {
 		return nil, err
 	}
 
-	return &SquashLayer{sb: sb, cq: cq, size: info.Size()}, nil
+	return &SquashLayer{sb: sb, cq: cq, size: info.Size(), cache: newBlockCache(defaultCacheBytes)}, nil
+}
+
+// SetCacheSize replaces the decompressed-block cache with one bounded to
+// maxBytes; maxBytes <= 0 disables caching. Call before serving any reads.
+func (s *SquashLayer) SetCacheSize(maxBytes int64) {
+	s.cache = newBlockCache(maxBytes)
 }
 
 // Open returns an fs.File backed by a KarpelesLab Inode (implements io.ReaderAt).
+// Regular files read through the archive's block cache when it is enabled.
 func (s *SquashLayer) Open(fusePath string) (fs.File, error) {
 	p := toFSPath(fusePath)
 	f, err := s.sb.Open(p)
@@ -80,7 +88,15 @@ func (s *SquashLayer) Open(fusePath string) (fs.File, error) {
 			f, err = s.sb.Open(resolved)
 		}
 	}
-	return f, err
+	if err != nil || s.cache == nil {
+		return f, err
+	}
+	if kf, ok := f.(*karp.File); ok {
+		if ino, ok := kf.Sys().(*karp.Inode); ok {
+			return newCachedFile(f, ino, int64(s.sb.BlockSize), s.cache), nil
+		}
+	}
+	return f, nil
 }
 
 // Stat returns fs.FileInfo for the given FUSE path (follows symlinks).

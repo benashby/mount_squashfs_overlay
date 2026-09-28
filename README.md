@@ -23,7 +23,7 @@ On Linux a cgofuse/libfuse bridge is used for testing.
 ## Usage
 
 ```
-mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] <squashfs-file>
+mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] [-cache-mb <n>] <squashfs-file>
 ```
 
 | Flag | Description |
@@ -31,6 +31,7 @@ mount.exe [-debug] -drive <X:> [-extractionpath <dir>] [-overlay <dir>] <squashf
 | `-drive <X:>` | Drive letter to mount at (required) |
 | `-overlay <dir>` | Persistent writable overlay directory (omit for read-only mount) |
 | `-extractionpath <dir>` | Accepted for compatibility with EmulatorLauncher; ignored |
+| `-cache-mb <n>` | Decompressed block cache in MiB, shared by all open files (default 256; `0` disables) |
 | `-debug` | Verbose output |
 
 The process runs until killed; killing it unmounts the drive.
