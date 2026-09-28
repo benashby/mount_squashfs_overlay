@@ -60,7 +60,15 @@ var _ gofs.FileSystem = (*OverlayFileSystem)(nil)
 
 // upper converts an overlay path (forward-slash, rooted) to an OS path
 // inside the upper directory.
+//
+// In read-only mode (no upper dir) it returns "", which every os.Stat/Lstat/
+// ReadDir/Open call rejects. Joining "" with a rooted name would otherwise
+// give a path like `\Windows`, which resolves against the root of the
+// process's current drive and leaks that drive's contents into the mount.
 func (ofs *OverlayFileSystem) upper(name string) string {
+	if ofs.upperDir == "" {
+		return ""
+	}
 	return filepath.Join(ofs.upperDir, filepath.FromSlash(name))
 }
 
@@ -132,6 +140,9 @@ func (ofs *OverlayFileSystem) OpenFile(name string, flag int, perm os.FileMode) 
 		// File doesn't exist in either layer (or is whited-out).
 		// Only create if O_CREATE is explicitly set.
 		if flag&os.O_CREATE != 0 {
+			if ofs.upperDir == "" {
+				return nil, os.ErrPermission
+			}
 			ofs.log("OpenFile: %q creating new file in upper", name)
 			if err := os.MkdirAll(filepath.Dir(up), 0755); err != nil {
 				return nil, err
@@ -269,7 +280,7 @@ func (ofs *OverlayFileSystem) Rename(source, target string) error {
 // ── Whiteout helpers ──────────────────────────────────────────────────
 
 func (ofs *OverlayFileSystem) hasWhiteout(name string) bool {
-	if name == "/" || name == "\\" || name == "." {
+	if ofs.upperDir == "" || name == "/" || name == "\\" || name == "." {
 		return false
 	}
 	dir := filepath.Dir(name)
@@ -280,6 +291,9 @@ func (ofs *OverlayFileSystem) hasWhiteout(name string) bool {
 }
 
 func (ofs *OverlayFileSystem) createWhiteout(name string) {
+	if ofs.upperDir == "" {
+		return
+	}
 	dir := filepath.Dir(name)
 	base := filepath.Base(name)
 	wp := filepath.Join(ofs.upperDir, filepath.FromSlash(dir), whiteoutPrefix+base)
@@ -290,6 +304,9 @@ func (ofs *OverlayFileSystem) createWhiteout(name string) {
 }
 
 func (ofs *OverlayFileSystem) removeWhiteout(name string) {
+	if ofs.upperDir == "" {
+		return
+	}
 	dir := filepath.Dir(name)
 	base := filepath.Base(name)
 	wp := filepath.Join(ofs.upperDir, filepath.FromSlash(dir), whiteoutPrefix+base)
