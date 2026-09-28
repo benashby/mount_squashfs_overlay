@@ -75,3 +75,23 @@ make
 
 Cross-compiles from Linux to Windows with `CGO_ENABLED=0 GOOS=windows GOARCH=amd64`.
 Build tags `xz` and `zstd` are enabled automatically (see [Makefile](Makefile)).
+
+## Test
+
+```
+make test        # or: go test -tags "xz zstd" .
+```
+
+All tests run on Windows; on Linux only the squashfs-layer tests apply (the
+overlay tests are Windows-only, and building needs libfuse for cgofuse).
+`go test ./...` fails because `tests/` holds standalone programs, each with
+its own `main()`, so test the root package only.
+
+`testdata/fixture.sqfs` is a small gzip image with a 1 MiB block size. Its
+content is generated deterministically by `squash_test.go`; to rebuild it you
+need `gensquashfs` from [squashfs-tools-ng](https://github.com/AgentD/squashfs-tools-ng)
+on `PATH` (or in `$GENSQUASHFS`):
+
+```
+go test -run TestGenerateFixture -gen-fixture .
+```
