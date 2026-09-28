@@ -5,6 +5,9 @@ squashoverlay is a drop-in replacement for the `mount.exe` used by
 It mounts a read-only squashfs archive as a Windows drive letter,
 with a persistent writable overlay directory layered on top using
 Docker/OCI-style whiteout conventions (`.wh.<name>` / `.wh..wh..opq`).
+Renaming a folder that comes from the archive copies nothing: the new
+folder gets a `.wh..wh..redirect` file holding the archive path of its
+contents, and the old name gets a whiteout.
 
 ## Architecture
 
