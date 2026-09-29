@@ -536,13 +536,23 @@ func (o *OverlayFS) Releasedir(path string, fh uint64) int { return 0 }
 // the upper directory. On Linux, FUSE always provides clean absolute paths
 // (e.g. "/dir/file"), so direct concatenation is safe and avoids the
 // filepath.Join alloc + path.Clean scan.
+//
+// In read-only mode (no upper dir) it returns "", which every os.* call
+// rejects; concatenating "" + "/etc" would otherwise expose the host root.
 func (o *OverlayFS) upper(fusePath string) string {
+	if o.upperDir == "" {
+		return ""
+	}
 	return o.upperDir + fusePath
 }
 
 // whiteoutPath returns the OS path of the whiteout marker for fusePath.
 // fusePath is a clean absolute FUSE path (e.g. "/dir/file").
+// Returns "" in read-only mode (see upper).
 func (o *OverlayFS) whiteoutPath(fusePath string) string {
+	if o.upperDir == "" {
+		return ""
+	}
 	i := strings.LastIndexByte(fusePath, '/')
 	// fusePath[:i] is the parent dir portion (may be "" for root-level entries).
 	// fusePath[i+1:] is the base name.

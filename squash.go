@@ -14,6 +14,7 @@ package main
 //                             KarpelesLab's per-call alloc pattern.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -33,9 +34,11 @@ type dirIndex map[string]string
 //   - sb  (KarpelesLab) for per-block FUSE reads
 //   - cq  (CalebQ42)    for parallel-WriteTo CoW copies
 type SquashLayer struct {
-	sb   *karp.Superblock
-	cq   caleb.Reader
-	size int64
+	sb    *karp.Superblock
+	cq    caleb.Reader
+	size  int64
+	cache *blockCache // nil when disabled
+	file  io.Closer   // the image file, when this layer opened it
 	// dirCache maps an fs-relative directory path → dirIndex (lowercase→realname).
 	// Populated lazily on first case-insensitive miss for a given directory.
 	// Safe to cache permanently: squashfs is immutable.
@@ -55,23 +58,64 @@ func NewSquashLayer(path string) (*SquashLayer, error) {
 		f.Close()
 		return nil, err
 	}
-
-	sb, err := karp.New(f)
+	sq, err := newSquashLayerFrom(f, info.Size())
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
+	sq.file = f
+	return sq, nil
+}
 
-	cq, err := caleb.NewReader(f)
+// Close releases the image file if this layer opened it. A layer made by
+// NewCachedSquashLayer reads through a *CachedImage, which the caller closes.
+func (s *SquashLayer) Close() error {
+	if s.file == nil {
+		return nil
+	}
+	return s.file.Close()
+}
+
+// NewCachedSquashLayer opens the archive through the disk cache dc. If the
+// cache for this image is held by another process it reads the image
+// directly instead; the returned *CachedImage is nil in that case.
+func NewCachedSquashLayer(path string, dc *DiskCache) (*SquashLayer, *CachedImage, error) {
+	img, err := dc.Open(path)
+	if errors.Is(err, errCacheBusy) {
+		sq, err := NewSquashLayer(path)
+		return sq, nil, err
+	}
 	if err != nil {
-		f.Close()
+		return nil, nil, err
+	}
+	sq, err := newSquashLayerFrom(img, img.Size())
+	if err != nil {
+		img.Close()
+		return nil, nil, err
+	}
+	return sq, img, nil
+}
+
+func newSquashLayerFrom(r io.ReaderAt, size int64) (*SquashLayer, error) {
+	sb, err := karp.New(r)
+	if err != nil {
 		return nil, err
 	}
+	cq, err := caleb.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	return &SquashLayer{sb: sb, cq: cq, size: size, cache: newBlockCache(defaultCacheBytes)}, nil
+}
 
-	return &SquashLayer{sb: sb, cq: cq, size: info.Size()}, nil
+// SetCacheSize replaces the decompressed-block cache with one bounded to
+// maxBytes; maxBytes <= 0 disables caching. Call before serving any reads.
+func (s *SquashLayer) SetCacheSize(maxBytes int64) {
+	s.cache = newBlockCache(maxBytes)
 }
 
 // Open returns an fs.File backed by a KarpelesLab Inode (implements io.ReaderAt).
+// Regular files read through the archive's block cache when it is enabled.
 func (s *SquashLayer) Open(fusePath string) (fs.File, error) {
 	p := toFSPath(fusePath)
 	f, err := s.sb.Open(p)
@@ -80,7 +124,15 @@ func (s *SquashLayer) Open(fusePath string) (fs.File, error) {
 			f, err = s.sb.Open(resolved)
 		}
 	}
-	return f, err
+	if err != nil || s.cache == nil {
+		return f, err
+	}
+	if kf, ok := f.(*karp.File); ok {
+		if ino, ok := kf.Sys().(*karp.Inode); ok {
+			return newCachedFile(f, ino, int64(s.sb.BlockSize), s.cache), nil
+		}
+	}
+	return f, nil
 }
 
 // Stat returns fs.FileInfo for the given FUSE path (follows symlinks).

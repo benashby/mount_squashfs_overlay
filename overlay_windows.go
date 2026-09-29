@@ -11,9 +11,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/winfsp/go-winfsp/gofs"
 )
@@ -22,9 +24,12 @@ import (
 //
 //	.wh.<name>        — marks <name> as deleted in the lower (squashfs) layer
 //	.wh..wh..opq      — marks the directory as opaque (hides all lower-layer contents)
+//	.wh..wh..redirect — the directory's lower-layer contents live at the
+//	                    squashfs path stored in this file (see Rename)
 const (
 	whiteoutPrefix = ".wh."
 	opaqueWhiteout = ".wh..wh..opq"
+	redirectMarker = ".wh..wh..redirect"
 )
 
 // OverlayFileSystem implements gofs.FileSystem, presenting a union of:
@@ -37,6 +42,13 @@ type OverlayFileSystem struct {
 	squash   *SquashLayer
 	upperDir string
 	debug    bool
+
+	// Renamed directories: lowercased overlay path ("/a/b") -> squashfs
+	// path of their lower-layer contents. Loaded from the redirect
+	// markers in the upper dir on first use.
+	redirOnce sync.Once
+	redirMu   sync.RWMutex
+	redirects map[string]string
 }
 
 func (ofs *OverlayFileSystem) log(format string, v ...any) {
@@ -60,8 +72,110 @@ var _ gofs.FileSystem = (*OverlayFileSystem)(nil)
 
 // upper converts an overlay path (forward-slash, rooted) to an OS path
 // inside the upper directory.
+//
+// In read-only mode (no upper dir) it returns "", which every os.Stat/Lstat/
+// ReadDir/Open call rejects. Joining "" with a rooted name would otherwise
+// give a path like `\Windows`, which resolves against the root of the
+// process's current drive and leaks that drive's contents into the mount.
 func (ofs *OverlayFileSystem) upper(name string) string {
+	if ofs.upperDir == "" {
+		return ""
+	}
 	return filepath.Join(ofs.upperDir, filepath.FromSlash(name))
+}
+
+// ── Renamed directories ───────────────────────────────────────────────
+//
+// Renaming a directory that has lower-layer contents does not copy them.
+// The directory is created (or moved) in the upper layer with a redirect
+// marker holding the squashfs path of its contents, and the old name gets
+// a whiteout. lower() maps overlay paths through those redirects before
+// every squashfs lookup, so the contents appear under the new name.
+
+// cleanOverlayPath returns name as a rooted, forward-slash path.
+func cleanOverlayPath(name string) string {
+	return path.Clean("/" + strings.ReplaceAll(name, `\`, "/"))
+}
+
+func (ofs *OverlayFileSystem) loadRedirects() {
+	ofs.redirects = map[string]string{}
+	if ofs.upperDir == "" {
+		return
+	}
+	filepath.WalkDir(ofs.upperDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != redirectMarker {
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(ofs.upperDir, filepath.Dir(p))
+		if err != nil {
+			return nil
+		}
+		ofs.redirects[strings.ToLower(cleanOverlayPath(rel))] = cleanOverlayPath(strings.TrimSpace(string(b)))
+		return nil
+	})
+	ofs.log("loaded %d directory redirects", len(ofs.redirects))
+}
+
+// lower maps an overlay path to the squashfs path holding its lower-layer
+// contents: the path itself, or a path under the nearest renamed ancestor's
+// original location.
+func (ofs *OverlayFileSystem) lower(name string) string {
+	p := cleanOverlayPath(name)
+	ofs.redirOnce.Do(ofs.loadRedirects)
+	ofs.redirMu.RLock()
+	defer ofs.redirMu.RUnlock()
+	if len(ofs.redirects) == 0 || p == "/" {
+		return p
+	}
+	parts := strings.Split(p[1:], "/")
+	base, rest := "", -1
+	prefix := ""
+	for i, part := range parts {
+		prefix += "/" + part
+		if l, ok := ofs.redirects[strings.ToLower(prefix)]; ok {
+			base, rest = l, i+1
+		}
+	}
+	if rest < 0 {
+		return p
+	}
+	return path.Join(append([]string{base}, parts[rest:]...)...)
+}
+
+// moveRedirects updates the redirect map after an upper-layer directory
+// moved from source to target, or was removed (target == "").
+func (ofs *OverlayFileSystem) moveRedirects(source, target string) {
+	ofs.redirOnce.Do(ofs.loadRedirects)
+	src := strings.ToLower(cleanOverlayPath(source))
+	ofs.redirMu.Lock()
+	defer ofs.redirMu.Unlock()
+	for k, v := range ofs.redirects {
+		if k != src && !strings.HasPrefix(k, src+"/") {
+			continue
+		}
+		delete(ofs.redirects, k)
+		if target != "" {
+			ofs.redirects[strings.ToLower(cleanOverlayPath(target))+k[len(src):]] = v
+		}
+	}
+}
+
+// addRedirect writes a redirect marker into the upper-layer directory at
+// name, pointing at the squashfs path lowerPath.
+func (ofs *OverlayFileSystem) addRedirect(name, lowerPath string) error {
+	marker := filepath.Join(ofs.upper(name), redirectMarker)
+	if err := os.WriteFile(marker, []byte(lowerPath+"\n"), 0o644); err != nil {
+		return err
+	}
+	ofs.redirOnce.Do(ofs.loadRedirects)
+	ofs.redirMu.Lock()
+	ofs.redirects[strings.ToLower(cleanOverlayPath(name))] = lowerPath
+	ofs.redirMu.Unlock()
+	return nil
 }
 
 // ── FileSystem interface ──────────────────────────────────────────────
@@ -73,11 +187,11 @@ func (ofs *OverlayFileSystem) Stat(name string) (os.FileInfo, error) {
 		ofs.log("Stat: %q -> upper ok, size=%d", name, info.Size())
 		return info, nil
 	}
-	if ofs.hasWhiteout(name) {
+	if ofs.lowerHidden(name) {
 		ofs.log("Stat: %q -> has whiteout", name)
 		return nil, os.ErrNotExist
 	}
-	info, err := ofs.squash.Stat(name)
+	info, err := ofs.squash.Stat(ofs.lower(name))
 	if err != nil {
 		ofs.log("Stat: %q -> squash err: %v", name, err)
 	} else {
@@ -117,7 +231,7 @@ func (ofs *OverlayFileSystem) OpenFile(name string, flag int, perm os.FileMode) 
 	// ── Whiteout check ──
 	// O_CREATE means the caller wants to create a fresh file; the whiteout
 	// should be cleared rather than blocking the open.
-	if ofs.hasWhiteout(name) {
+	if ofs.lowerHidden(name) {
 		if flag&os.O_CREATE == 0 {
 			ofs.log("OpenFile: %q is whiteout", name)
 			return nil, os.ErrNotExist
@@ -126,12 +240,18 @@ func (ofs *OverlayFileSystem) OpenFile(name string, flag int, perm os.FileMode) 
 	}
 
 	// ── Squashfs layer ──
-	sqInfo, err := ofs.squash.Stat(name)
+	sqInfo, err := ofs.squash.Stat(ofs.lower(name))
+	if err == nil && ofs.lowerHidden(name) {
+		err = os.ErrNotExist
+	}
 	if err != nil {
 		ofs.log("OpenFile squash.Stat err: %v", err)
 		// File doesn't exist in either layer (or is whited-out).
 		// Only create if O_CREATE is explicitly set.
 		if flag&os.O_CREATE != 0 {
+			if ofs.upperDir == "" {
+				return nil, os.ErrPermission
+			}
 			ofs.log("OpenFile: %q creating new file in upper", name)
 			if err := os.MkdirAll(filepath.Dir(up), 0755); err != nil {
 				return nil, err
@@ -171,7 +291,7 @@ func (ofs *OverlayFileSystem) OpenFile(name string, flag int, perm os.FileMode) 
 	}
 
 	// Read-only squashfs file.
-	sqf, err := ofs.squash.Open(name)
+	sqf, err := ofs.squash.Open(ofs.lower(name))
 	if err != nil {
 		ofs.log("OpenFile squash.Open err: %v", err)
 		return nil, err
@@ -186,10 +306,17 @@ func (ofs *OverlayFileSystem) Mkdir(name string, perm os.FileMode) error {
 		return ofs.logErr("Mkdir", name, os.ErrPermission)
 	}
 	up := ofs.upper(name)
+	hidden := ofs.lowerHidden(name)
 	if err := os.MkdirAll(up, perm|0111); err != nil {
 		return ofs.logErr("Mkdir", name, err)
 	}
 	ofs.removeWhiteout(name)
+	// A directory made where a deleted one was starts empty.
+	if hidden {
+		if info, err := ofs.squash.Stat(ofs.lower(name)); err == nil && info.IsDir() {
+			ofs.makeOpaque(name)
+		}
+	}
 	return ofs.logErr("Mkdir", name, nil)
 }
 
@@ -217,8 +344,11 @@ func (ofs *OverlayFileSystem) Remove(name string) error {
 	} else {
 		ofs.log("Remove: %q not in upper (%v)", name, upperErr)
 	}
+	if upperErr == nil && info.IsDir() {
+		ofs.moveRedirects(name, "")
+	}
 	// If the entry exists in squashfs, plant a whiteout.
-	if _, err := ofs.squash.Stat(name); err == nil {
+	if _, err := ofs.squash.Stat(ofs.lower(name)); err == nil {
 		ofs.log("Remove: %q exists in squashfs, creating whiteout", name)
 		ofs.createWhiteout(name)
 	}
@@ -238,27 +368,61 @@ func (ofs *OverlayFileSystem) Rename(source, target string) error {
 	}
 
 	existsInUpper := false
-	if _, err := os.Lstat(srcUp); err == nil {
+	upInfo, err := os.Lstat(srcUp)
+	if err == nil {
 		existsInUpper = true
 	}
 	ofs.log("Rename: %q existsInUpper=%v", source, existsInUpper)
 
-	if existsInUpper {
+	// Lower-layer contents of the source, found before anything moves.
+	srcLower := ofs.lower(source)
+	targetHidden := ofs.lowerHidden(target)
+	sqInfo, sqErr := ofs.squash.Stat(srcLower)
+	if !existsInUpper && sqErr != nil {
+		return ofs.logErr("Rename", source, os.ErrNotExist)
+	}
+	isDir := (existsInUpper && upInfo.IsDir()) || (!existsInUpper && sqInfo.IsDir())
+
+	switch {
+	case isDir:
+		// Move the upper part, if any, and point the new name at the
+		// lower contents instead of copying them.
+		if existsInUpper {
+			if err := os.Rename(srcUp, dstUp); err != nil {
+				return ofs.logErr("Rename", source, err)
+			}
+			ofs.moveRedirects(source, target)
+		} else if err := os.MkdirAll(dstUp, 0755); err != nil {
+			return ofs.logErr("Rename", source, err)
+		}
+		_, markerErr := os.Lstat(filepath.Join(dstUp, redirectMarker))
+		_, opaqueErr := os.Lstat(filepath.Join(dstUp, opaqueWhiteout))
+		redirected := markerErr == nil
+		if sqErr == nil && sqInfo.IsDir() && !ofs.lowerHidden(source) && markerErr != nil && opaqueErr != nil {
+			if err := ofs.addRedirect(target, srcLower); err != nil {
+				return ofs.logErr("Rename", source, err)
+			}
+			redirected = true
+		}
+		// Landing on a deleted name must not bring its old contents back.
+		if !redirected && opaqueErr != nil && targetHidden {
+			if info, err := ofs.squash.Stat(ofs.lower(target)); err == nil && info.IsDir() {
+				ofs.makeOpaque(target)
+			}
+		}
+	case existsInUpper:
 		if err := os.Rename(srcUp, dstUp); err != nil {
 			return ofs.logErr("Rename", source, err)
 		}
-	} else {
-		// Source only in squashfs: CoW it to the new upper location.
-		if _, err := ofs.squash.Stat(source); err != nil {
-			return ofs.logErr("Rename", source, os.ErrNotExist)
-		}
-		if err := ofs.copySquashToUpperAt(source, target); err != nil {
+	default:
+		// File only in squashfs: CoW it to the new upper location.
+		if err := ofs.copySquashToUpperAt(srcLower, target); err != nil {
 			return ofs.logErr("Rename", source, err)
 		}
 	}
 
-	// If source existed in squashfs, hide it with a whiteout.
-	if _, err := ofs.squash.Stat(source); err == nil {
+	// If lower-layer contents still show at the old name, hide them.
+	if _, err := ofs.squash.Stat(ofs.lower(source)); err == nil {
 		ofs.log("Rename: source %q exists in squashfs, creating whiteout", source)
 		ofs.createWhiteout(source)
 	}
@@ -268,18 +432,47 @@ func (ofs *OverlayFileSystem) Rename(source, target string) error {
 
 // ── Whiteout helpers ──────────────────────────────────────────────────
 
-func (ofs *OverlayFileSystem) hasWhiteout(name string) bool {
-	if name == "/" || name == "\\" || name == "." {
+// lowerHidden reports whether the lower layer is hidden at name: by a
+// whiteout of name or of any of its parents, or by an opaque parent. It
+// walks the upper dir from the root and stops at the first component
+// that has no upper directory, since nothing deeper can exist there.
+func (ofs *OverlayFileSystem) lowerHidden(name string) bool {
+	p := cleanOverlayPath(name)
+	if ofs.upperDir == "" || p == "/" {
 		return false
 	}
-	dir := filepath.Dir(name)
-	base := filepath.Base(name)
-	wp := filepath.Join(ofs.upperDir, filepath.FromSlash(dir), whiteoutPrefix+base)
-	_, err := os.Lstat(wp)
-	return err == nil
+	parts := strings.Split(p[1:], "/")
+	dir := ofs.upperDir
+	for i, part := range parts {
+		if _, err := os.Lstat(filepath.Join(dir, whiteoutPrefix+part)); err == nil {
+			return true
+		}
+		if i == len(parts)-1 {
+			return false
+		}
+		dir = filepath.Join(dir, part)
+		if _, err := os.Lstat(filepath.Join(dir, opaqueWhiteout)); err == nil {
+			return true
+		}
+		if _, err := os.Lstat(dir); err != nil {
+			return false
+		}
+	}
+	return false
+}
+
+// makeOpaque marks the upper directory at name as hiding all lower-layer
+// contents at that path.
+func (ofs *OverlayFileSystem) makeOpaque(name string) {
+	if f, err := os.Create(filepath.Join(ofs.upper(name), opaqueWhiteout)); err == nil {
+		f.Close()
+	}
 }
 
 func (ofs *OverlayFileSystem) createWhiteout(name string) {
+	if ofs.upperDir == "" {
+		return
+	}
 	dir := filepath.Dir(name)
 	base := filepath.Base(name)
 	wp := filepath.Join(ofs.upperDir, filepath.FromSlash(dir), whiteoutPrefix+base)
@@ -290,6 +483,9 @@ func (ofs *OverlayFileSystem) createWhiteout(name string) {
 }
 
 func (ofs *OverlayFileSystem) removeWhiteout(name string) {
+	if ofs.upperDir == "" {
+		return
+	}
 	dir := filepath.Dir(name)
 	base := filepath.Base(name)
 	wp := filepath.Join(ofs.upperDir, filepath.FromSlash(dir), whiteoutPrefix+base)
@@ -299,7 +495,7 @@ func (ofs *OverlayFileSystem) removeWhiteout(name string) {
 // ── CoW helpers ───────────────────────────────────────────────────────
 
 func (ofs *OverlayFileSystem) copySquashToUpper(name string) error {
-	return ofs.copySquashToUpperAt(name, name)
+	return ofs.copySquashToUpperAt(ofs.lower(name), name)
 }
 
 func (ofs *OverlayFileSystem) copySquashToUpperAt(sqPath, destPath string) error {
@@ -395,9 +591,9 @@ func (ofs *OverlayFileSystem) mergeDir(path string) []os.FileInfo {
 		}
 	}
 
-	// Lower (squashfs) layer entries — unless opaque.
-	if !opaque {
-		if sqDes, err := ofs.squash.ReadDir(path); err == nil {
+	// Lower (squashfs) layer entries — unless opaque or deleted.
+	if !opaque && !ofs.lowerHidden(path) {
+		if sqDes, err := ofs.squash.ReadDir(ofs.lower(path)); err == nil {
 			ofs.log("mergeDir(%q) ReadDir got %d entries", path, len(sqDes))
 			for _, de := range sqDes {
 				name := de.Name()

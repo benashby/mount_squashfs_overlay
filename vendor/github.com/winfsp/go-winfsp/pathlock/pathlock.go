@@ -202,6 +202,29 @@ func (l *Lock) Downgrade() {
 	l.write = false
 }
 
+// TryUpgrade turns a reader lock into a writer lock if its holder is
+// the only one locking the path, including anything below it. It
+// reports whether the lock is now a writer lock. The root is never
+// write locked.
+func (l *Lock) TryUpgrade() bool {
+	if l.write {
+		return true
+	}
+	if l.path == "" || l.path == "/" || l.path == "." {
+		return false
+	}
+	obj, ok := l.locker.m.Load(l.path)
+	if !ok {
+		return false
+	}
+	// 2 is a single reader: this lock. 0 marks the writer.
+	if !atomic.CompareAndSwapUintptr(obj.(*uintptr), 2, 0) {
+		return false
+	}
+	l.write = true
+	return true
+}
+
 func (l *Lock) Unlock() {
 	runtime.SetFinalizer(l, nil)
 	l.free.Do(func() {

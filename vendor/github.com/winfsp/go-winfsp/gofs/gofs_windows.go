@@ -48,6 +48,12 @@ type fileHandle struct {
 	flags int
 	mtx   sync.RWMutex
 
+	// deleteAccess is set when the handle was opened with DELETE
+	// access or FILE_DELETE_ON_CLOSE. Such a handle may hold only a
+	// reader lock; it takes the writer lock when it renames or
+	// deletes (see writeLocked).
+	deleteAccess bool
+
 	evaluatedIndex uint64
 }
 
@@ -410,13 +416,23 @@ func (fs *fileSystem) openFile(
 	}
 
 	// Lock the file with desired mode.
+	//
+	// Windows grants DELETE access while other handles are open, as
+	// long as they share delete; a rename or delete then fails only if
+	// the file is still in use when it happens. Explorer relies on
+	// this: it opens files and folders with DELETE while its own
+	// handles on them are open. So when the writer lock is taken,
+	// fall back to a reader lock and upgrade it on rename or delete.
+	deleteAccess := (createOptions&windows.FILE_DELETE_ON_CLOSE != 0) ||
+		(grantedAccess&windows.DELETE != 0)
 	lockFunc := fs.locker.RLock
-	if (createOptions&windows.FILE_DELETE_ON_CLOSE != 0) ||
-		(grantedAccess&windows.DELETE != 0) ||
-		(disposition == windows.FILE_SUPERSEDE) {
+	if deleteAccess || (disposition == windows.FILE_SUPERSEDE) {
 		lockFunc = fs.locker.Lock
 	}
 	lock := lockFunc(name)
+	if lock == nil && deleteAccess {
+		lock = fs.locker.RLock(name)
+	}
 	if lock == nil {
 		return 0, windows.STATUS_SHARING_VIOLATION
 	}
@@ -429,7 +445,8 @@ func (fs *fileSystem) openFile(
 
 	// Attempt to allocate the file handle.
 	handle := &fileHandle{
-		lock: lock,
+		lock:         lock,
+		deleteAccess: deleteAccess,
 	}
 	handleAddr := uintptr(unsafe.Pointer(handle))
 	_, loaded := fs.handles.LoadOrStore(handleAddr, handle)
@@ -1014,6 +1031,23 @@ func (fs *fileSystem) Flush(
 
 var _ winfsp.BehaviourFlush = (*fileSystem)(nil)
 
+// writeLocked makes sure the handle holds the writer lock on its path,
+// which renaming or deleting requires. A handle opened with delete
+// access that got only a reader lock takes the writer lock now; that
+// fails while any other handle has the path, or a path below it, open.
+func (handle *fileHandle) writeLocked() error {
+	if handle.lock.IsWrite() {
+		return nil
+	}
+	if !handle.deleteAccess {
+		return windows.STATUS_ACCESS_DENIED
+	}
+	if handle.lock.TryUpgrade() {
+		return nil
+	}
+	return windows.STATUS_SHARING_VIOLATION
+}
+
 func (fs *fileSystem) CanDelete(
 	ref *winfsp.FileSystemRef, file uintptr,
 	name string,
@@ -1026,8 +1060,8 @@ func (fs *fileSystem) CanDelete(
 		return err
 	}
 	defer handle.unlockChecked()
-	if !handle.lock.IsWrite() {
-		return windows.STATUS_ACCESS_DENIED
+	if err := handle.writeLocked(); err != nil {
+		return err
 	}
 	fileInfo, err := handle.file.Stat()
 	if err != nil {
@@ -1064,7 +1098,7 @@ func (fs *fileSystem) Cleanup(
 	if cleanupFlags&winfsp.FspCleanupDelete == 0 {
 		return
 	}
-	if !handle.lock.IsWrite() {
+	if handle.writeLocked() != nil {
 		return
 	}
 	handle.mtx.Lock()
@@ -1087,8 +1121,8 @@ func (fs *fileSystem) Rename(
 	if err != nil {
 		return err
 	}
-	if !handle.lock.IsWrite() {
-		return windows.STATUS_ACCESS_DENIED
+	if err := handle.writeLocked(); err != nil {
+		return err
 	}
 	handle.mtx.Lock()
 	defer handle.mtx.Unlock()

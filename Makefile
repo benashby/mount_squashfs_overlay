@@ -7,12 +7,13 @@
 #   make              – build mount.exe
 #   make vendor       – go mod vendor + apply patches
 #   make clean        – remove built binary
+#   make test         – run unit tests on the host OS
 
 BINARY      := mount.exe
 GOOS        := windows
 GOARCH      := amd64
 
-.PHONY: all vendor clean help winres
+.PHONY: all vendor clean help winres test
 
 all: $(BINARY)
 
@@ -46,6 +47,11 @@ $(BINARY): vendor/modules.txt $(shell find . -path ./vendor -prune -o -name '*.g
 	go build -tags "xz zstd" -ldflags="-s -w" -trimpath -o $(BINARY) .
 	@echo "Done: $(BINARY)"
 
+# ── Tests ────────────────────────────────────────────────────────────────
+# Root package only: tests/ holds standalone programs, each with its own main().
+test:
+	go test -tags "xz zstd" .
+
 # ── Housekeeping ───────────────────────────────────────────────────────────
 clean:
 	rm -f $(BINARY)
@@ -56,3 +62,4 @@ help:
 	@echo "  make          build mount.exe (vendors automatically if needed)"
 	@echo "  make vendor   go mod vendor + apply patches/"
 	@echo "  make clean    remove binary"
+	@echo "  make test     run unit tests"
